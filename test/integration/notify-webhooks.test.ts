@@ -67,4 +67,32 @@ describe('notification webhooks', () => {
     expect(r).toEqual({ ok: true, error: null });
     expect(sent).toHaveLength(1);
   });
+
+  it('uses a custom name and an uploaded avatar, served publicly', async () => {
+    // 1×1 PNG.
+    const png = 'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==';
+    await admin.post('/api/admin/notify-webhooks', { type: 'discord', url: 'https://hooks.test/av', username: 'Inbox bot', avatarImage: png, avatarUrl: 'https://ignored.test/x.png' });
+    const [hook] = await admin.get('/api/admin/notify-webhooks');
+    expect(hook.avatarUrl).toBeNull();
+    expect(hook.avatarResolved).toMatch(/\/api\/webhooks\/avatar\/\d+\/[0-9a-f]{16}$/);
+
+    await deliver(email({ subject: 'Hi' }), { from: 'ann@sender.test', to: 'admin@example.com' });
+    const body = sent[0].body as { username: string; avatar_url: string };
+    expect(body.username).toBe('Inbox bot');
+    expect(body.avatar_url).toBe(hook.avatarResolved);
+
+    // Anyone can fetch it (Discord does), but only with the right hash.
+    const path = new URL(hook.avatarResolved).pathname;
+    const anon = new Client();
+    const img = await anon.request('GET', path);
+    expect(img.status).toBe(200);
+    expect(img.headers.get('Content-Type')).toBe('image/png');
+    expect((await anon.request('GET', path.replace(/[0-9a-f]{16}$/, '0000000000000000'))).status).toBe(404);
+
+    // An image URL instead.
+    await admin.put(`/api/admin/notify-webhooks/${hook.id}`, { ...hook, avatarImage: null, avatarUrl: 'https://cdn.test/logo.png' });
+    sent = [];
+    await deliver(email({ subject: 'Again' }), { from: 'ann@sender.test', to: 'admin@example.com' });
+    expect((sent[0].body as { avatar_url: string }).avatar_url).toBe('https://cdn.test/logo.png');
+  });
 });

@@ -1,6 +1,6 @@
 // Admin API: dashboard data, users, mailboxes, domains, providers, Cloudflare token, storage,
 // settings, logs and maintenance. Mounted behind requireAdmin.
-import { Hono } from 'hono';
+import { Hono, type Context } from 'hono';
 import type { AppBindings } from '../types';
 import { body, intParam } from '../lib/validate';
 import {
@@ -21,6 +21,7 @@ import {
   updateMailboxSchema,
   updateUserSchema,
   notifyWebhookSchema,
+  type NotifyWebhookInput,
 } from '../../shared/schemas';
 import { all, first, run } from '../db/db';
 import { loadSettings, saveSettings, type AppSettings } from '../db/settings';
@@ -72,7 +73,7 @@ import {
 } from '../services/providers';
 import { listSuppressions, removeSuppression } from '../services/webhooks';
 import { retryMessage } from '../services/send';
-import { recordResult, rowToHook, sendHook } from '../services/notify-webhooks';
+import { avatarFor, HOOK_COLUMNS, imageHash, recordResult, rowToHook, sendHook, type HookRow } from '../services/notify-webhooks';
 import { deleteBlobs } from '../services/threads';
 import { Cloudflare, cfFromEnv, DEFAULT_CF_API } from '../cloudflare/client';
 import { checkPermissions, listZones, verifyToken } from '../cloudflare/token';
@@ -601,12 +602,37 @@ admin.post('/failures/:id/retry', async (c) => c.json(await retryMessage(c.env, 
 const MAX_HOOKS = 50;
 
 admin.get('/notify-webhooks', async (c) => {
-  const rows = await all<{ id: number; name: string; type: 'discord' | 'json'; url: string; addresses: string; events: string; fields: string; enabled: number; last_status: string | null; last_error: string | null; last_at: number | null }>(
+  const settings = await settingsOf(c);
+  const rows = await all<HookRow & { name: string; enabled: number; avatar_image: string | null; last_status: string | null; last_error: string | null; last_at: number | null }>(
     c.env.DB,
-    'SELECT id, name, type, url, addresses, events, fields, enabled, last_status, last_error, last_at FROM notify_webhooks ORDER BY id',
+    `SELECT ${HOOK_COLUMNS}, name, enabled, avatar_image, last_status, last_error, last_at FROM notify_webhooks ORDER BY id`,
   );
-  return c.json(rows.map((r) => ({ ...rowToHook(r), name: r.name, enabled: !!r.enabled, lastStatus: r.last_status, lastError: r.last_error, lastAt: r.last_at })));
+  return c.json(
+    rows.map((r) => {
+      const { avatar, ...hook } = rowToHook(r, settings.appUrl);
+      return { ...hook, name: r.name, enabled: !!r.enabled, avatarUrl: r.avatar_url, avatarImage: r.avatar_image, avatarResolved: avatar ?? null, lastStatus: r.last_status, lastError: r.last_error, lastAt: r.last_at };
+    }),
+  );
 });
+
+// Columns written from the form, in the order of the SQL below.
+async function hookValues(c: Context<AppBindings>, h: NotifyWebhookInput) {
+  const image = h.type === 'discord' ? h.avatarImage : null;
+  return [
+    h.name,
+    h.type,
+    h.url,
+    JSON.stringify(h.addresses),
+    JSON.stringify(h.events),
+    JSON.stringify(h.fields),
+    h.enabled ? 1 : 0,
+    h.type === 'discord' ? h.username : '',
+    h.type === 'discord' && !image ? h.avatarUrl : null,
+    image,
+    image ? await imageHash(image) : null,
+    new URL(c.req.url).origin,
+  ];
+}
 
 admin.post('/notify-webhooks', async (c) => {
   const h = await body(c, notifyWebhookSchema);
@@ -615,8 +641,11 @@ admin.post('/notify-webhooks', async (c) => {
   const id = newId();
   await run(
     c.env.DB,
-    'INSERT INTO notify_webhooks (id, name, type, url, addresses, events, fields, enabled, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)',
-    id, h.name, h.type, h.url, JSON.stringify(h.addresses), JSON.stringify(h.events), JSON.stringify(h.fields), h.enabled ? 1 : 0, Date.now(),
+    `INSERT INTO notify_webhooks (name, type, url, addresses, events, fields, enabled, username, avatar_url, avatar_image, avatar_hash, public_origin, id, created_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    ...(await hookValues(c, h)),
+    id,
+    Date.now(),
   );
   await audit(c.env.DB, { userId: currentUser(c).id, action: 'webhook.created', target: h.name || h.type, ip: clientIp(c) });
   return c.json({ id });
@@ -625,8 +654,11 @@ admin.post('/notify-webhooks', async (c) => {
 admin.put('/notify-webhooks/:id', async (c) => {
   const id = intParam(c, 'id');
   const h = await body(c, notifyWebhookSchema);
-  const res = await c.env.DB.prepare('UPDATE notify_webhooks SET name = ?, type = ?, url = ?, addresses = ?, events = ?, fields = ?, enabled = ? WHERE id = ?')
-    .bind(h.name, h.type, h.url, JSON.stringify(h.addresses), JSON.stringify(h.events), JSON.stringify(h.fields), h.enabled ? 1 : 0, id)
+  const res = await c.env.DB.prepare(
+    `UPDATE notify_webhooks SET name = ?, type = ?, url = ?, addresses = ?, events = ?, fields = ?, enabled = ?, username = ?, avatar_url = ?, avatar_image = ?, avatar_hash = ?, public_origin = ?
+     WHERE id = ?`,
+  )
+    .bind(...(await hookValues(c, h)), id)
     .run();
   if (!res.meta.changes) throw notFound('Webhook not found.');
   return c.json({ ok: true });
@@ -639,14 +671,21 @@ admin.delete('/notify-webhooks/:id', async (c) => {
   return c.json({ ok: true });
 });
 
-// Sends a sample notification with the given, possibly unsaved, settings.
+// Sends a sample notification with the given, possibly unsaved, settings. An unsaved pasted image
+// has no public URL yet, so the test then uses the default logo; saving first fixes that.
 admin.post('/notify-webhooks/test', async (c) => {
   const h = await body(c, notifyWebhookSchema);
   const id = Number(c.req.query('id')) || 0;
   const settings = await settingsOf(c);
+  let avatar = h.avatarImage ? undefined : h.avatarUrl ?? undefined;
+  if (h.avatarImage && id) {
+    const hash = await imageHash(h.avatarImage);
+    const saved = await first<{ avatar_hash: string | null }>(c.env.DB, 'SELECT avatar_hash FROM notify_webhooks WHERE id = ?', id);
+    if (saved?.avatar_hash === hash) avatar = avatarFor({ id, avatar_url: null, avatar_hash: hash, public_origin: new URL(c.req.url).origin }, settings.appUrl);
+  }
   const sample = h.addresses.find((a) => !a.startsWith('@')) ?? (h.addresses[0] ? `hello${h.addresses[0]}` : currentUser(c).email);
   const error = await sendHook(
-    { id, type: h.type, url: h.url, addresses: h.addresses, events: h.events, fields: h.fields },
+    { id, type: h.type, url: h.url, addresses: h.addresses, events: h.events, fields: h.fields, username: h.username, avatar },
     {
       event: h.events[0],
       mailbox: sample,

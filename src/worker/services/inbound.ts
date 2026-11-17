@@ -419,7 +419,7 @@ export async function ingest(c: Context, bytes: Uint8Array, o: IngestOptions): P
     const event = spamReason ? 'spam' : 'received';
     const link = settings.appUrl ? `${settings.appUrl.replace(/\/+$/, '')}/mail/${mailboxId}/${folder}/${threadId}` : null;
     o.ctx.waitUntil(
-      notifyWebhooks(env, [o.rcpt, o.recipient.address], { event, mailbox: o.recipient.address, to: o.rcpt, from: p.from, subject: p.subject, snippet, date: p.date, link }),
+      notifyWebhooks(env, settings.appUrl, [o.rcpt, o.recipient.address], { event, mailbox: o.recipient.address, to: o.rcpt, from: p.from, subject: p.subject, snippet, date: p.date, link }),
     );
   }
   if (!spamReason && o.message) await sideEffects(c, o, mailboxId, threadId, p, actions);

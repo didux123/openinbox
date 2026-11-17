@@ -189,6 +189,22 @@ export const notifyWebhookSchema = z.object({
   events: z.array(z.enum(NOTIFY_EVENTS)).min(1, 'Pick at least one event.').default(['received']),
   fields: z.array(z.enum(NOTIFY_FIELDS)).min(1, 'Pick at least one field.').default(['to', 'from', 'subject']),
   enabled: z.boolean().default(true),
+  username: z.string().trim().max(80).default(''),
+  avatarUrl: z
+    .string()
+    .trim()
+    .url()
+    .max(500)
+    .refine((u) => u.startsWith('https://'), 'The image URL must start with https://.')
+    .nullable()
+    .default(null),
+  // A small image pasted or uploaded in the browser, already resized to 256×256.
+  avatarImage: z
+    .string()
+    .max(400_000, 'The image is too large.')
+    .regex(/^data:image\/(png|jpeg|webp|gif);base64,[A-Za-z0-9+/=]+$/, 'Unsupported image.')
+    .nullable()
+    .default(null),
 });
 export type NotifyWebhookInput = z.infer<typeof notifyWebhookSchema>;
 

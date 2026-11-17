@@ -18,6 +18,8 @@ export interface NotifyHook {
   addresses: string[];
   events: NotifyEvent[];
   fields: NotifyField[];
+  username?: string;
+  avatar?: string; // resolved public URL
 }
 
 export interface NotifyMessage {
@@ -31,7 +33,7 @@ export interface NotifyMessage {
   link: string | null;
 }
 
-const CLOUDFLARE_AVATAR = 'https://www.google.com/s2/favicons?domain=cloudflare.com&sz=256';
+export const CLOUDFLARE_AVATAR = 'https://www.google.com/s2/favicons?domain=cloudflare.com&sz=256';
 const TIMEOUT_MS = 8000;
 
 const clip = (s: string, n: number) => (s.length > n ? `${s.slice(0, n - 1)}…` : s);
@@ -55,8 +57,8 @@ export function discordPayload(hook: NotifyHook, m: NotifyMessage) {
   if (f.has('snippet') && m.snippet) fields.push({ name: 'Preview', value: clip(m.snippet, 1024) });
   if (f.has('date')) fields.push({ name: 'Received', value: `<t:${Math.floor(m.date / 1000)}:f>` });
   return {
-    username: 'Cloudflare',
-    avatar_url: CLOUDFLARE_AVATAR,
+    username: hook.username || 'Cloudflare',
+    avatar_url: hook.avatar || CLOUDFLARE_AVATAR,
     allowed_mentions: { parse: [] },
     embeds: [
       {
@@ -104,16 +106,32 @@ export async function recordResult(db: D1Database, id: number, error: string | n
   await run(db, 'UPDATE notify_webhooks SET last_status = ?, last_error = ?, last_at = ? WHERE id = ?', error ? 'error' : 'ok', error, Date.now(), id);
 }
 
-interface HookRow {
+export interface HookRow {
   id: number;
   type: 'discord' | 'json';
   url: string;
   addresses: string;
   events: string;
   fields: string;
+  username: string;
+  avatar_url: string | null;
+  avatar_hash: string | null;
+  public_origin: string | null;
 }
 
-export function rowToHook(r: HookRow): NotifyHook {
+export const HOOK_COLUMNS = 'id, type, url, addresses, events, fields, username, avatar_url, avatar_hash, public_origin';
+
+// Public path of an uploaded avatar. The hash changes with the image, so Discord's cache never
+// shows a stale one.
+export const avatarPath = (id: number, hash: string) => `/api/webhooks/avatar/${id}/${hash}`;
+
+export function avatarFor(r: Pick<HookRow, 'id' | 'avatar_url' | 'avatar_hash' | 'public_origin'>, appUrl: string | null): string | undefined {
+  const origin = (appUrl || r.public_origin || '').replace(/\/+$/, '');
+  if (r.avatar_hash && origin) return origin + avatarPath(r.id, r.avatar_hash);
+  return r.avatar_url || undefined;
+}
+
+export function rowToHook(r: HookRow, appUrl: string | null = null): NotifyHook {
   return {
     id: r.id,
     type: r.type,
@@ -121,14 +139,30 @@ export function rowToHook(r: HookRow): NotifyHook {
     addresses: parseJson<string[]>(r.addresses, []),
     events: parseJson<NotifyEvent[]>(r.events, ['received']),
     fields: parseJson<NotifyField[]>(r.fields, ['to', 'from', 'subject']),
+    username: r.username,
+    avatar: avatarFor(r, appUrl),
   };
 }
 
+export async function imageHash(dataUrl: string): Promise<string> {
+  const digest = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(dataUrl));
+  return [...new Uint8Array(digest)].slice(0, 8).map((b) => b.toString(16).padStart(2, '0')).join('');
+}
+
+export function decodeDataUrl(dataUrl: string): { type: string; bytes: Uint8Array<ArrayBuffer> } | null {
+  const m = /^data:(image\/(?:png|jpeg|webp|gif));base64,(.+)$/.exec(dataUrl);
+  if (!m) return null;
+  const bin = atob(m[2]);
+  const bytes = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+  return { type: m[1], bytes };
+}
+
 // Called once per stored inbound message.
-export async function notifyWebhooks(env: Env, matchAddresses: string[], m: NotifyMessage): Promise<void> {
+export async function notifyWebhooks(env: Env, appUrl: string | null, matchAddresses: string[], m: NotifyMessage): Promise<void> {
   try {
-    const rows = await all<HookRow>(env.DB, 'SELECT id, type, url, addresses, events, fields FROM notify_webhooks WHERE enabled = 1');
-    const hooks = rows.map(rowToHook).filter((h) => matches(h, m.event, matchAddresses));
+    const rows = await all<HookRow>(env.DB, `SELECT ${HOOK_COLUMNS} FROM notify_webhooks WHERE enabled = 1`);
+    const hooks = rows.map((r) => rowToHook(r, appUrl)).filter((h) => matches(h, m.event, matchAddresses));
     await Promise.all(
       hooks.map(async (h) => {
         const error = await sendHook(h, m);

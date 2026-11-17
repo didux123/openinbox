@@ -1,7 +1,7 @@
 // Mail flow → Webhooks: notify Discord or any HTTPS endpoint when mail arrives.
-import { useState } from 'react';
+import { useRef, useState, type ClipboardEvent, type DragEvent } from 'react';
 import { useQuery } from '@tanstack/react-query';
-import { Plus, Send, Trash, Webhook, X } from 'lucide-react';
+import { ImageUp, Plus, RotateCcw, Send, Trash, Webhook, X } from 'lucide-react';
 import { del, get, post, put } from '../../lib/api';
 import { timeAgo } from '../../lib/format';
 import { useAction } from '../../lib/hooks';
@@ -23,6 +23,10 @@ interface Hook {
   events: Event[];
   fields: FieldKey[];
   enabled: boolean;
+  username: string;
+  avatarUrl: string | null;
+  avatarImage: string | null;
+  avatarResolved?: string | null;
   lastStatus?: 'ok' | 'error' | null;
   lastError?: string | null;
   lastAt?: number | null;
@@ -42,7 +46,21 @@ const FIELDS: { value: FieldKey; label: string }[] = [
   { value: 'link', label: 'Link to the message' },
 ];
 
-const BLANK: Hook = { name: '', type: 'discord', url: '', addresses: [], events: ['received'], fields: ['to', 'from', 'subject'], enabled: true };
+const BLANK: Hook = { name: '', type: 'discord', url: '', addresses: [], events: ['received'], fields: ['to', 'from', 'subject'], enabled: true, username: '', avatarUrl: null, avatarImage: null };
+const CLOUDFLARE_AVATAR = 'https://www.google.com/s2/favicons?domain=cloudflare.com&sz=256';
+const AVATAR_SIZE = 256;
+
+// Center-crops and scales any image to a 256×256 PNG data URL, small enough to store in D1.
+async function toAvatar(file: Blob): Promise<string> {
+  if (!file.type.startsWith('image/')) throw new Error('That is not an image.');
+  const bitmap = await createImageBitmap(file);
+  const side = Math.min(bitmap.width, bitmap.height);
+  const canvas = document.createElement('canvas');
+  canvas.width = canvas.height = AVATAR_SIZE;
+  canvas.getContext('2d')!.drawImage(bitmap, (bitmap.width - side) / 2, (bitmap.height - side) / 2, side, side, 0, 0, AVATAR_SIZE, AVATAR_SIZE);
+  bitmap.close();
+  return canvas.toDataURL('image/png');
+}
 
 export function WebhooksTab() {
   const q = useQuery({ queryKey: ['admin', 'notify-webhooks'], queryFn: () => get<Hook[]>('/admin/notify-webhooks') });
@@ -71,6 +89,7 @@ export function WebhooksTab() {
         <div className="divide-y divide-border">
           {hooks.map((h) => (
             <div key={h.id} className="flex items-center gap-3 px-5 py-3">
+              {h.type === 'discord' && <img src={h.avatarImage || h.avatarUrl || CLOUDFLARE_AVATAR} alt="" className="h-8 w-8 shrink-0 rounded-full bg-surface-2 object-cover" />}
               <Switch checked={h.enabled} label={`Enable ${h.name || 'webhook'}`} onChange={(v) => run('t', () => put(`/admin/notify-webhooks/${h.id}`, { ...h, enabled: v }).then(() => q.refetch()))} />
               <div className="min-w-0 flex-1">
                 <div className="flex items-center gap-2 text-sm font-medium">
@@ -114,7 +133,42 @@ function WebhookDialog({ hook, onClose, onSaved }: { hook: Hook; onClose: () => 
   const known = [...new Set((boxes.data ?? []).flatMap((b) => [b.address, ...b.aliases.map((a) => a.address)]))].sort();
   const domains = [...new Set(known.map((a) => `@${a.split('@')[1]}`))].sort();
 
-  const payload = () => ({ name: h.name, type: h.type, url: h.url, addresses: h.addresses, events: h.events, fields: h.fields, enabled: h.enabled });
+  const payload = () => ({
+    name: h.name,
+    type: h.type,
+    url: h.url,
+    addresses: h.addresses,
+    events: h.events,
+    fields: h.fields,
+    enabled: h.enabled,
+    username: h.username,
+    avatarUrl: h.avatarImage ? null : h.avatarUrl || null,
+    avatarImage: h.avatarImage,
+  });
+  const fileInput = useRef<HTMLInputElement>(null);
+  const [imageError, setImageError] = useState('');
+  const takeImage = async (file: Blob | null | undefined) => {
+    if (!file) return;
+    setImageError('');
+    try {
+      const avatarImage = await toAvatar(file);
+      setH((cur) => ({ ...cur, avatarImage, avatarUrl: null }));
+    } catch (e) {
+      setImageError(e instanceof Error ? e.message : 'Could not read that image.');
+    }
+  };
+  const onPaste = (e: ClipboardEvent) => {
+    const file = [...e.clipboardData.items].find((i) => i.type.startsWith('image/'))?.getAsFile();
+    if (file) {
+      e.preventDefault();
+      void takeImage(file);
+    }
+  };
+  const onDrop = (e: DragEvent) => {
+    e.preventDefault();
+    void takeImage(e.dataTransfer.files[0]);
+  };
+  const imageUnsaved = !!h.avatarImage && h.avatarImage !== hook.avatarImage;
   const toggle = <T,>(list: T[], v: T, on: boolean) => (on ? [...new Set([...list, v])] : list.filter((x) => x !== v));
   const addAddress = (raw: string) => {
     const v = raw.trim().toLowerCase();
@@ -167,6 +221,51 @@ function WebhookDialog({ hook, onClose, onSaved }: { hook: Hook; onClose: () => 
             <Input value={h.url} onChange={(e) => setH({ ...h, url: e.target.value.trim() })} placeholder={h.type === 'discord' ? 'https://discord.com/api/webhooks/…' : 'https://…'} />
           </Field>
         </div>
+
+        {h.type === 'discord' && (
+          <div className="space-y-3 rounded-lg border border-border p-4" onPaste={onPaste} onDragOver={(e) => e.preventDefault()} onDrop={onDrop}>
+            <div className="text-[13px] font-medium">How it appears in Discord</div>
+            <div className="flex items-start gap-4">
+              <button
+                type="button"
+                onClick={() => fileInput.current?.click()}
+                className="group relative h-16 w-16 shrink-0 overflow-hidden rounded-full border border-dashed border-border bg-surface-2 outline-none focus-visible:ring-2 focus-visible:ring-primary"
+                aria-label="Change the image"
+                title="Click, paste or drop an image"
+              >
+                <img src={h.avatarImage || h.avatarUrl || CLOUDFLARE_AVATAR} alt="" className="h-full w-full object-cover" onError={() => setImageError('This URL does not load as an image.')} />
+                <span className="absolute inset-0 grid place-items-center bg-black/45 text-white opacity-0 transition-opacity group-hover:opacity-100">
+                  <ImageUp className="h-5 w-5" />
+                </span>
+              </button>
+              <div className="min-w-0 flex-1 space-y-2.5">
+                <Field label="Name">
+                  <Input value={h.username} onChange={(e) => setH({ ...h, username: e.target.value })} placeholder="Cloudflare" maxLength={80} />
+                </Field>
+                <Field label="Image" hint="Paste an image here (Ctrl/Cmd+V), drop one, click the picture to upload, or give a URL.">
+                  <div className="flex gap-2">
+                    <Input
+                      value={h.avatarImage ? '' : (h.avatarUrl ?? '')}
+                      onChange={(e) => {
+                        setImageError('');
+                        setH({ ...h, avatarImage: null, avatarUrl: e.target.value.trim() || null });
+                      }}
+                      placeholder={h.avatarImage ? 'Uploaded image' : 'https://…/logo.png'}
+                    />
+                    {(h.avatarImage || h.avatarUrl) && (
+                      <Button variant="ghost" icon={<RotateCcw className="h-4 w-4" />} onClick={() => setH({ ...h, avatarImage: null, avatarUrl: null })}>
+                        Default
+                      </Button>
+                    )}
+                  </div>
+                </Field>
+                {imageError && <div className="text-xs text-danger">{imageError}</div>}
+                {imageUnsaved && <div className="text-xs text-muted">Save the webhook so Discord can load this image; until then a test uses the default logo.</div>}
+              </div>
+              <input ref={fileInput} type="file" accept="image/*" className="hidden" onChange={(e) => void takeImage(e.target.files?.[0])} />
+            </div>
+          </div>
+        )}
 
         <div className="space-y-3 rounded-lg border border-border p-4">
           <div className="text-[13px] font-medium">Only for mail sent to</div>
