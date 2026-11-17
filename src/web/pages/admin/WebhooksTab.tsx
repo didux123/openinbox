@@ -1,5 +1,5 @@
 // Mail flow → Webhooks: notify Discord or any HTTPS endpoint when mail arrives.
-import { useRef, useState, type ClipboardEvent, type DragEvent } from 'react';
+import { useEffect, useRef, useState, type ClipboardEvent, type DragEvent } from 'react';
 import { useQuery } from '@tanstack/react-query';
 import { AtSign, CornerDownLeft, Globe, ImageUp, Plus, RotateCcw, Send, Trash, Webhook, X } from 'lucide-react';
 import { del, get, post, put } from '../../lib/api';
@@ -90,7 +90,7 @@ export function WebhooksTab() {
         <div className="divide-y divide-border">
           {hooks.map((h) => (
             <div key={h.id} className="flex items-center gap-3 px-5 py-3">
-              {h.type === 'discord' && <img src={h.avatarImage || h.avatarUrl || CLOUDFLARE_AVATAR} alt="" className="h-8 w-8 shrink-0 rounded-full bg-surface-2 object-cover" />}
+              {h.type === 'discord' && <HookAvatar src={h.avatarImage || h.avatarUrl || CLOUDFLARE_AVATAR} />}
               <Switch checked={h.enabled} label={`Enable ${h.name || 'webhook'}`} onChange={(v) => run('t', () => put(`/admin/notify-webhooks/${h.id}`, { ...h, enabled: v }).then(() => q.refetch()))} />
               <div className="min-w-0 flex-1">
                 <div className="flex items-center gap-2 text-sm font-medium">
@@ -169,6 +169,8 @@ function WebhookDialog({ hook, onClose, onSaved }: { hook: Hook; onClose: () => 
     void takeImage(e.dataTransfer.files[0]);
   };
   const imageUnsaved = !!h.avatarImage && h.avatarImage !== hook.avatarImage;
+  const preview = h.avatarImage || h.avatarUrl || CLOUDFLARE_AVATAR;
+  const [previewFailed, setPreviewFailed] = useState<string | null>(null);
   const toggle = <T,>(list: T[], v: T, on: boolean) => (on ? [...new Set([...list, v])] : list.filter((x) => x !== v));
   const addAddress = (raw: string) => {
     const v = raw.trim().toLowerCase();
@@ -228,11 +230,23 @@ function WebhookDialog({ hook, onClose, onSaved }: { hook: Hook; onClose: () => 
               <button
                 type="button"
                 onClick={() => fileInput.current?.click()}
-                className="group relative h-16 w-16 shrink-0 overflow-hidden rounded-full border border-dashed border-border bg-surface-2 outline-none focus-visible:ring-2 focus-visible:ring-primary"
+                className="group relative grid h-16 w-16 shrink-0 overflow-hidden rounded-full border border-dashed border-border bg-surface-2 outline-none focus-visible:ring-2 focus-visible:ring-primary"
                 aria-label="Change the image"
                 title="Click, paste or drop an image"
               >
-                <img src={h.avatarImage || h.avatarUrl || CLOUDFLARE_AVATAR} alt="" className="h-full w-full object-cover" onError={() => setImageError('This URL does not load as an image.')} />
+                {previewFailed === preview ? (
+                  <Webhook className="m-auto h-6 w-6 text-faint" />
+                ) : (
+                  <img
+                    src={preview}
+                    alt=""
+                    className="h-full w-full object-cover"
+                    onError={() => {
+                      setPreviewFailed(preview);
+                      if (preview === h.avatarUrl) setImageError('This URL does not load as an image.');
+                    }}
+                  />
+                )}
                 <span className="absolute inset-0 grid place-items-center bg-black/45 text-white opacity-0 transition-opacity group-hover:opacity-100">
                   <ImageUp className="h-5 w-5" />
                 </span>
@@ -327,7 +341,7 @@ function AddressPicker({ known, domains, chosen, onAdd }: { known: string[]; dom
         e.preventDefault();
         commit(choice);
       } else if (e.key !== 'Tab') e.preventDefault();
-    } else if (e.key === 'Escape') setOpen(false);
+    }
   };
   const row = (o: { value: string; domain: boolean }, i: number) => (
     <button
@@ -349,6 +363,19 @@ function AddressPicker({ known, domains, chosen, onAdd }: { known: string[]; dom
     </button>
   );
   const nDomains = options.filter((o) => o.domain).length;
+  const listOpen = open && options.length > 0;
+  // The dialog closes on Escape from a document capture listener; a window capture listener runs
+  // first, so Escape only closes the suggestions while they are shown.
+  useEffect(() => {
+    if (!listOpen) return;
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key !== 'Escape') return;
+      e.stopPropagation();
+      setOpen(false);
+    };
+    window.addEventListener('keydown', onKey, true);
+    return () => window.removeEventListener('keydown', onKey, true);
+  }, [listOpen]);
   return (
     <div className="relative flex gap-2">
       <Input
@@ -363,13 +390,13 @@ function AddressPicker({ known, domains, chosen, onAdd }: { known: string[]; dom
         onKeyDown={onKeyDown}
         placeholder="contact@example.com or @example.com"
         role="combobox"
-        aria-expanded={open && options.length > 0}
+        aria-expanded={listOpen}
         aria-autocomplete="list"
       />
       <Button variant="ghost" onClick={() => valid && commit(q)} disabled={!valid}>
         Add
       </Button>
-      {open && options.length > 0 && (
+      {listOpen && (
         <div role="listbox" className="scroll-thin absolute top-full left-0 z-30 mt-1 max-h-72 w-full max-w-[420px] overflow-y-auto rounded-[10px] border border-border bg-surface p-[5px] shadow-pop animate-fade-in">
           {nDomains > 0 && <div className="px-2 pt-1 pb-1 text-[11.5px] font-medium text-faint">Domains</div>}
           {options.slice(0, nDomains).map((o, i) => row(o, i))}
@@ -378,5 +405,14 @@ function AddressPicker({ known, domains, chosen, onAdd }: { known: string[]; dom
         </div>
       )}
     </div>
+  );
+}
+
+function HookAvatar({ src }: { src: string }) {
+  const [failed, setFailed] = useState<string | null>(null);
+  return (
+    <span className="grid h-8 w-8 shrink-0 place-items-center overflow-hidden rounded-full bg-surface-2">
+      {failed === src ? <Webhook className="h-4 w-4 text-faint" /> : <img src={src} alt="" className="h-full w-full object-cover" onError={() => setFailed(src)} />}
+    </span>
   );
 }
