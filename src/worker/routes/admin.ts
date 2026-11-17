@@ -20,6 +20,7 @@ import {
   setupTokenSchema,
   updateMailboxSchema,
   updateUserSchema,
+  notifyWebhookSchema,
 } from '../../shared/schemas';
 import { all, first, run } from '../db/db';
 import { loadSettings, saveSettings, type AppSettings } from '../db/settings';
@@ -71,6 +72,7 @@ import {
 } from '../services/providers';
 import { listSuppressions, removeSuppression } from '../services/webhooks';
 import { retryMessage } from '../services/send';
+import { recordResult, rowToHook, sendHook } from '../services/notify-webhooks';
 import { deleteBlobs } from '../services/threads';
 import { Cloudflare, cfFromEnv, DEFAULT_CF_API } from '../cloudflare/client';
 import { checkPermissions, listZones, verifyToken } from '../cloudflare/token';
@@ -593,6 +595,72 @@ admin.get('/failures', async (c) => {
 });
 
 admin.post('/failures/:id/retry', async (c) => c.json(await retryMessage(c.env, null, intParam(c, 'id'))));
+
+// Notification webhooks (Mail flow → Webhooks) ----------------------------------------------------
+
+const MAX_HOOKS = 50;
+
+admin.get('/notify-webhooks', async (c) => {
+  const rows = await all<{ id: number; name: string; type: 'discord' | 'json'; url: string; addresses: string; events: string; fields: string; enabled: number; last_status: string | null; last_error: string | null; last_at: number | null }>(
+    c.env.DB,
+    'SELECT id, name, type, url, addresses, events, fields, enabled, last_status, last_error, last_at FROM notify_webhooks ORDER BY id',
+  );
+  return c.json(rows.map((r) => ({ ...rowToHook(r), name: r.name, enabled: !!r.enabled, lastStatus: r.last_status, lastError: r.last_error, lastAt: r.last_at })));
+});
+
+admin.post('/notify-webhooks', async (c) => {
+  const h = await body(c, notifyWebhookSchema);
+  const count = await first<{ n: number }>(c.env.DB, 'SELECT COUNT(*) AS n FROM notify_webhooks');
+  if ((count?.n ?? 0) >= MAX_HOOKS) throw badRequest(`You can have at most ${MAX_HOOKS} webhooks.`);
+  const id = newId();
+  await run(
+    c.env.DB,
+    'INSERT INTO notify_webhooks (id, name, type, url, addresses, events, fields, enabled, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)',
+    id, h.name, h.type, h.url, JSON.stringify(h.addresses), JSON.stringify(h.events), JSON.stringify(h.fields), h.enabled ? 1 : 0, Date.now(),
+  );
+  await audit(c.env.DB, { userId: currentUser(c).id, action: 'webhook.created', target: h.name || h.type, ip: clientIp(c) });
+  return c.json({ id });
+});
+
+admin.put('/notify-webhooks/:id', async (c) => {
+  const id = intParam(c, 'id');
+  const h = await body(c, notifyWebhookSchema);
+  const res = await c.env.DB.prepare('UPDATE notify_webhooks SET name = ?, type = ?, url = ?, addresses = ?, events = ?, fields = ?, enabled = ? WHERE id = ?')
+    .bind(h.name, h.type, h.url, JSON.stringify(h.addresses), JSON.stringify(h.events), JSON.stringify(h.fields), h.enabled ? 1 : 0, id)
+    .run();
+  if (!res.meta.changes) throw notFound('Webhook not found.');
+  return c.json({ ok: true });
+});
+
+admin.delete('/notify-webhooks/:id', async (c) => {
+  const id = intParam(c, 'id');
+  await run(c.env.DB, 'DELETE FROM notify_webhooks WHERE id = ?', id);
+  await audit(c.env.DB, { userId: currentUser(c).id, action: 'webhook.deleted', target: String(id), ip: clientIp(c) });
+  return c.json({ ok: true });
+});
+
+// Sends a sample notification with the given, possibly unsaved, settings.
+admin.post('/notify-webhooks/test', async (c) => {
+  const h = await body(c, notifyWebhookSchema);
+  const id = Number(c.req.query('id')) || 0;
+  const settings = await settingsOf(c);
+  const sample = h.addresses.find((a) => !a.startsWith('@')) ?? (h.addresses[0] ? `hello${h.addresses[0]}` : currentUser(c).email);
+  const error = await sendHook(
+    { id, type: h.type, url: h.url, addresses: h.addresses, events: h.events, fields: h.fields },
+    {
+      event: h.events[0],
+      mailbox: sample,
+      to: sample,
+      from: { name: 'OpenInbox', address: currentUser(c).email },
+      subject: 'Test notification',
+      snippet: 'If you can read this, the webhook works.',
+      date: Date.now(),
+      link: settings.appUrl ? `${settings.appUrl.replace(/\/+$/, '')}/mail` : null,
+    },
+  );
+  if (id) await recordResult(c.env.DB, id, error);
+  return c.json({ ok: !error, error });
+});
 
 admin.get('/suppressions', async (c) => c.json(await listSuppressions(c.env.DB)));
 admin.delete('/suppressions/:address', async (c) => {

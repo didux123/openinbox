@@ -7,6 +7,7 @@ import { useAction, useInvalidate } from '../../lib/hooks';
 import { cn } from '../../lib/utils';
 import { Button } from '../../components/ui/button';
 import { Alert, Card, EmptyState, PageHeader, PageSpinner, Tabs, type Tone } from '../../components/ui/misc';
+import { WebhooksTab } from './WebhooksTab';
 
 interface InboundEntry {
   id: number;
@@ -72,7 +73,7 @@ function clock(ms: number): string {
 const grid = 'grid grid-cols-[64px_minmax(0,1fr)_88px] items-center gap-3.5 px-[18px] md:grid-cols-[76px_minmax(0,2.2fr)_minmax(0,1.6fr)_100px_minmax(0,1.4fr)]';
 
 export function MailFlowPage() {
-  const [tab, setTab] = useState<'inbound' | 'cloudflare' | 'failures'>('inbound');
+  const [tab, setTab] = useState<'inbound' | 'cloudflare' | 'failures' | 'webhooks'>('inbound');
   const [filter, setFilter] = useState('');
   const [status, setStatus] = useState('');
   const failures = useQuery({ queryKey: ['admin', 'failures'], queryFn: () => get<Failure[]>('/admin/failures') });
@@ -86,9 +87,10 @@ export function MailFlowPage() {
           { value: 'inbound', label: 'Inbound log' },
           { value: 'cloudflare', label: 'Cloudflare Email Routing' },
           { value: 'failures', label: 'Problems', count: failures.data?.length, tone: 'danger' },
+          { value: 'webhooks', label: 'Webhooks' },
         ]}
       >
-        {tab !== 'failures' && (
+        {(tab === 'inbound' || tab === 'cloudflare') && (
           <div className="flex h-[30px] w-full items-center gap-2 rounded-[7px] border border-border bg-surface px-2.5 focus-within:border-primary sm:w-60">
             <Search className="h-3.5 w-3.5 text-faint" />
             <input value={filter} onChange={(e) => setFilter(e.target.value)} placeholder="Filter by address or subject" aria-label="Filter by address or subject" className="min-w-0 flex-1 bg-transparent text-[12.5px] outline-none placeholder:text-faint" />
@@ -108,6 +110,7 @@ export function MailFlowPage() {
       {tab === 'inbound' && <InboundLog status={status} filter={filter} />}
       {tab === 'cloudflare' && <CloudflareLog filter={filter} />}
       {tab === 'failures' && <Failures data={failures.data} loading={failures.isLoading} />}
+      {tab === 'webhooks' && <WebhooksTab />}
     </div>
   );
 }

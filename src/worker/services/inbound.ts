@@ -24,6 +24,7 @@ import { applyFilters, loadFilters, type FilterActions } from './filters';
 import { counterStmt, dailyStatStmt, inboundLogStmt, logInbound } from './stats';
 import { bumpState, type AutoReply } from './mailboxes';
 import { maybeAutoReply } from './autoreply';
+import { notifyWebhooks } from './notify-webhooks';
 
 export interface Recipient {
   mailboxId: number;
@@ -414,6 +415,13 @@ export async function ingest(c: Context, bytes: Uint8Array, o: IngestOptions): P
     threaded: !!thread,
   });
 
+  if (o.message && o.ctx) {
+    const event = spamReason ? 'spam' : 'received';
+    const link = settings.appUrl ? `${settings.appUrl.replace(/\/+$/, '')}/mail/${mailboxId}/${folder}/${threadId}` : null;
+    o.ctx.waitUntil(
+      notifyWebhooks(env, [o.rcpt, o.recipient.address], { event, mailbox: o.recipient.address, to: o.rcpt, from: p.from, subject: p.subject, snippet, date: p.date, link }),
+    );
+  }
   if (!spamReason && o.message) await sideEffects(c, o, mailboxId, threadId, p, actions);
   return { status: spamReason ? 'spam' : 'delivered', messageId, threadId };
 }

@@ -173,6 +173,25 @@ export const filterSchema = z.object({
   enabled: z.boolean().default(true),
 });
 
+export const NOTIFY_EVENTS = ['received', 'spam'] as const;
+export const NOTIFY_FIELDS = ['to', 'from', 'subject', 'snippet', 'date', 'link'] as const;
+
+export const notifyWebhookSchema = z.object({
+  name: z.string().trim().max(80).default(''),
+  type: z.enum(['discord', 'json']),
+  url: z
+    .string()
+    .trim()
+    .url()
+    .max(500)
+    .refine((u) => u.startsWith('https://'), 'The URL must start with https://.'),
+  addresses: z.array(z.string().trim().toLowerCase().min(3).max(254).regex(/^[^\s@]*@[^\s@]+$/, 'Use a full address or @domain.')).max(50).default([]),
+  events: z.array(z.enum(NOTIFY_EVENTS)).min(1, 'Pick at least one event.').default(['received']),
+  fields: z.array(z.enum(NOTIFY_FIELDS)).min(1, 'Pick at least one field.').default(['to', 'from', 'subject']),
+  enabled: z.boolean().default(true),
+});
+export type NotifyWebhookInput = z.infer<typeof notifyWebhookSchema>;
+
 export const noteSchema = z.object({ body: z.string().trim().min(1).max(5000) });
 export const blockSchema = z.object({ pattern: z.string().trim().min(3).max(254), mailboxId: id.nullable().optional() });
 export const destinationSchema = z.object({ email: z.string().trim().email().max(254) });
