@@ -1,11 +1,12 @@
 // Mail flow → Webhooks: notify Discord or any HTTPS endpoint when mail arrives.
 import { useRef, useState, type ClipboardEvent, type DragEvent } from 'react';
 import { useQuery } from '@tanstack/react-query';
-import { ImageUp, Plus, RotateCcw, Send, Trash, Webhook, X } from 'lucide-react';
+import { AtSign, CornerDownLeft, Globe, ImageUp, Plus, RotateCcw, Send, Trash, Webhook, X } from 'lucide-react';
 import { del, get, post, put } from '../../lib/api';
 import { timeAgo } from '../../lib/format';
 import { useAction } from '../../lib/hooks';
 import type { MailboxAdmin } from '../../lib/types';
+import { cn } from '../../lib/utils';
 import { Button } from '../../components/ui/button';
 import { Checkbox, Field, Input, Switch, ChoiceCards } from '../../components/ui/form';
 import { Card, CardHeader, EmptyState, PageSpinner, StatusPill } from '../../components/ui/misc';
@@ -127,7 +128,6 @@ export function WebhooksTab() {
 
 function WebhookDialog({ hook, onClose, onSaved }: { hook: Hook; onClose: () => void; onSaved: () => void }) {
   const [h, setH] = useState<Hook>(hook);
-  const [draft, setDraft] = useState('');
   const { run, busy } = useAction();
   const boxes = useQuery({ queryKey: ['admin', 'mailboxes'], queryFn: () => get<MailboxAdmin[]>('/admin/mailboxes') });
   const known = [...new Set((boxes.data ?? []).flatMap((b) => [b.address, ...b.aliases.map((a) => a.address)]))].sort();
@@ -173,7 +173,6 @@ function WebhookDialog({ hook, onClose, onSaved }: { hook: Hook; onClose: () => 
   const addAddress = (raw: string) => {
     const v = raw.trim().toLowerCase();
     if (v) setH((cur) => ({ ...cur, addresses: [...new Set([...cur.addresses, v])] }));
-    setDraft('');
   };
   const save = () => run('save', () => (h.id ? put(`/admin/notify-webhooks/${h.id}`, payload()) : post('/admin/notify-webhooks', payload())).then(onSaved), 'Webhook saved');
   const test = () =>
@@ -280,28 +279,7 @@ function WebhookDialog({ hook, onClose, onSaved }: { hook: Hook; onClose: () => 
               </span>
             ))}
           </div>
-          <div className="flex gap-2">
-            <Input
-              list="webhook-addresses"
-              value={draft}
-              onChange={(e) => setDraft(e.target.value)}
-              onKeyDown={(e) => {
-                if (e.key === 'Enter' || e.key === ',') {
-                  e.preventDefault();
-                  addAddress(draft);
-                }
-              }}
-              placeholder="contact@example.com or @example.com"
-            />
-            <Button variant="ghost" onClick={() => addAddress(draft)} disabled={!draft.trim()}>
-              Add
-            </Button>
-            <datalist id="webhook-addresses">
-              {[...known, ...domains].map((a) => (
-                <option key={a} value={a} />
-              ))}
-            </datalist>
-          </div>
+          <AddressPicker known={known} domains={domains} chosen={h.addresses} onAdd={addAddress} />
         </div>
 
         <div className="grid gap-4 sm:grid-cols-2">
@@ -320,5 +298,85 @@ function WebhookDialog({ hook, onClose, onSaved }: { hook: Hook; onClose: () => 
         </div>
       </div>
     </Dialog>
+  );
+}
+
+// Text field with suggestions: whole domains first, then known addresses. Free text is accepted
+// too, for catch-all addresses that no inbox lists.
+function AddressPicker({ known, domains, chosen, onAdd }: { known: string[]; domains: string[]; chosen: string[]; onAdd: (v: string) => void }) {
+  const [draft, setDraft] = useState('');
+  const [open, setOpen] = useState(false);
+  const [active, setActive] = useState(0);
+  const q = draft.trim().toLowerCase();
+  const pick = (list: string[]) => list.filter((a) => !chosen.includes(a) && (!q || a.includes(q)));
+  const options = [...pick(domains).map((value) => ({ value, domain: true })), ...pick(known).map((value) => ({ value, domain: false }))];
+  const valid = /^[^\s@]*@[^\s@]+\.[^\s@]+$/.test(q);
+  const commit = (v: string) => {
+    onAdd(v);
+    setDraft('');
+    setActive(0);
+  };
+  const onKeyDown = (e: React.KeyboardEvent<HTMLInputElement>) => {
+    if (e.key === 'ArrowDown' || e.key === 'ArrowUp') {
+      e.preventDefault();
+      setOpen(true);
+      if (options.length) setActive((i) => (i + (e.key === 'ArrowDown' ? 1 : options.length - 1)) % options.length);
+    } else if (e.key === 'Enter' || e.key === ',' || e.key === 'Tab') {
+      const choice = open && options[active] ? options[active].value : valid ? q : null;
+      if (choice) {
+        e.preventDefault();
+        commit(choice);
+      } else if (e.key !== 'Tab') e.preventDefault();
+    } else if (e.key === 'Escape') setOpen(false);
+  };
+  const row = (o: { value: string; domain: boolean }, i: number) => (
+    <button
+      key={o.value}
+      type="button"
+      role="option"
+      aria-selected={i === active}
+      onMouseDown={(e) => {
+        e.preventDefault();
+        commit(o.value);
+      }}
+      onMouseEnter={() => setActive(i)}
+      className={cn('flex h-9 w-full items-center gap-2.5 rounded-[7px] px-2 text-left text-[13px]', i === active && 'bg-surface-2')}
+    >
+      {o.domain ? <Globe className="h-[15px] w-[15px] shrink-0 text-faint" /> : <AtSign className="h-[15px] w-[15px] shrink-0 text-faint" />}
+      <span className="min-w-0 flex-1 truncate">{o.value}</span>
+      {o.domain && <span className="shrink-0 text-xs text-faint">every address</span>}
+      {i === active && <CornerDownLeft className="h-[13px] w-[13px] shrink-0 text-faint" />}
+    </button>
+  );
+  const nDomains = options.filter((o) => o.domain).length;
+  return (
+    <div className="relative flex gap-2">
+      <Input
+        value={draft}
+        onChange={(e) => {
+          setDraft(e.target.value);
+          setOpen(true);
+          setActive(0);
+        }}
+        onFocus={() => setOpen(true)}
+        onBlur={() => setOpen(false)}
+        onKeyDown={onKeyDown}
+        placeholder="contact@example.com or @example.com"
+        role="combobox"
+        aria-expanded={open && options.length > 0}
+        aria-autocomplete="list"
+      />
+      <Button variant="ghost" onClick={() => valid && commit(q)} disabled={!valid}>
+        Add
+      </Button>
+      {open && options.length > 0 && (
+        <div role="listbox" className="scroll-thin absolute top-full left-0 z-30 mt-1 max-h-72 w-full max-w-[420px] overflow-y-auto rounded-[10px] border border-border bg-surface p-[5px] shadow-pop animate-fade-in">
+          {nDomains > 0 && <div className="px-2 pt-1 pb-1 text-[11.5px] font-medium text-faint">Domains</div>}
+          {options.slice(0, nDomains).map((o, i) => row(o, i))}
+          {options.length > nDomains && <div className={cn('px-2 pb-1 text-[11.5px] font-medium text-faint', nDomains > 0 ? 'mt-1 border-t border-border pt-2' : 'pt-1')}>Addresses</div>}
+          {options.slice(nDomains).map((o, i) => row(o, i + nDomains))}
+        </div>
+      )}
+    </div>
   );
 }
